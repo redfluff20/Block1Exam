@@ -12,6 +12,7 @@ text + OCR + caption, so there is no separate "concept" layer to drift or
 duplicate content. Redundancy in questions simply mirrors redundancy in the
 source slides themselves.
 """
+import os
 import json
 import random
 import re
@@ -187,7 +188,9 @@ def _weighted_sample_without_replacement(pool, weights, k):
 def select_slides(lecture_ids=None, target=MAX_QUESTIONS, exclude_slide_ids=None):
     """Select slides across chosen lectures (or all), spreading evenly across
     lectures while biasing toward slides with the fewest generated questions.
-    Returns list of {slide_id, lecture_id, lecture_title, slide_num, text, caption, ocr}.
+    A slide is eligible if it has extractable text OR at least one page image
+    (the vision model reads the image directly).
+    Returns list of {slide_id, lecture_id, lecture_title, slide_num, text, caption}.
     exclude_slide_ids: slide ids to skip (used for top-up after skips/shortfalls)."""
     exclude = set(exclude_slide_ids or [])
     conn = get_conn()
@@ -203,10 +206,11 @@ def select_slides(lecture_ids=None, target=MAX_QUESTIONS, exclude_slide_ids=None
     pool = []
     for l in lectures:
         rows = conn.execute(
-            "SELECT id, slide_num, text, caption, ocr_text FROM slides "
-            "WHERE lecture_id=? AND (length(trim(text)) >= ? OR length(trim(ocr_text)) >= ?) "
-            "ORDER BY slide_num",
-            (l["id"], MIN_SLIDE_WORDS, MIN_SLIDE_WORDS),
+            "SELECT s.id, s.slide_num, s.text, s.caption FROM slides s "
+            "WHERE s.lecture_id=? AND (length(trim(s.text)) >= ? "
+            "OR EXISTS (SELECT 1 FROM slide_images si WHERE si.slide_id=s.id)) "
+            "ORDER BY s.slide_num",
+            (l["id"], MIN_SLIDE_WORDS),
         ).fetchall()
         for r in rows:
             if r["id"] in exclude:
@@ -219,13 +223,32 @@ def select_slides(lecture_ids=None, target=MAX_QUESTIONS, exclude_slide_ids=None
                     "slide_num": r["slide_num"],
                     "text": r["text"] or "",
                     "caption": r["caption"] or "",
-                    "ocr": r["ocr_text"] or "",
                 }
             )
     conn.close()
 
     if not pool:
         return []
+
+    # Attach absolute image paths (page renders) so vision question-gen can read them.
+    conn = get_conn()
+    ph = ",".join("?" * len(pool))
+    img_rows = conn.execute(
+        f"SELECT slide_id, path FROM slide_images WHERE slide_id IN ({ph}) ORDER BY seq",
+        tuple(s["slide_id"] for s in pool),
+    ).fetchall()
+    conn.close()
+    from app.ingest.images import IMAGES_ROOT
+    _VISION_IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
+    imgs_by_slide = {}
+    for r in img_rows:
+        if os.path.splitext(r["path"])[1].lower() not in _VISION_IMAGE_EXTS:
+            continue
+        imgs_by_slide.setdefault(r["slide_id"], []).append(
+            os.path.join(IMAGES_ROOT, r["path"])
+        )
+    for s in pool:
+        s["image_paths"] = imgs_by_slide.get(s["slide_id"], [])
 
     # Per-lecture, weighted-sample so under-covered slides come first, then
     # round-robin across lectures so every chosen lecture is represented.
@@ -284,15 +307,20 @@ def _question_from_result(s, result):
 
 
 def _build_batch_prompt(batch):
-    """Build one prompt covering `batch` slides with clear separators."""
+    """Build one prompt covering `batch` slides. Images are attached separately
+    (vision mode) so the model reads each slide's page image directly."""
     blocks = []
     for i, s in enumerate(batch):
-        slide_text = (s["text"] or "").strip() or (s["ocr"] or "").strip()
+        slide_text = (s["text"] or "").strip()
         caption = (s["caption"] or "").strip()
-        img = f"\n[Image caption]: {caption}" if caption else ""
+        img_note = ""
+        if s.get("image_paths"):
+            img_note = f"\n[Attached image: page image for this slide]"
+        if caption:
+            img_note += f"\n[Image caption]: {caption}"
         blocks.append(
             f"SLIDE {i} | Lecture: {s['lecture_title']} | Slide number: {s['slide_num']}\n"
-            f"{slide_text}{img}"
+            f"{slide_text}{img_note}"
         )
     head = QUESTION_BATCH_PROMPT.format(
         count=len(batch),
@@ -332,16 +360,20 @@ def _best_slide_index(qtext, batch, declared):
 
 
 def _gen_batch(batch):
-    """Generate questions for a single batch of slides in one API call.
+    """Generate questions for a single batch of slides in one vision API call.
     Returns a list of valid question dicts (may be fewer than the batch size)."""
     if not batch:
         return []
     prompt = _build_batch_prompt(batch)
+    images = []
+    for s in batch:
+        images.extend(s.get("image_paths") or [])
     result = chat_json(
         prompt,
         system=QUESTION_SYSTEM,
         temperature=0.7,
         max_tokens=min(8000, 500 + 700 * len(batch)),
+        images=images or None,
     )
     out = []
     for q in result.get("questions") or []:

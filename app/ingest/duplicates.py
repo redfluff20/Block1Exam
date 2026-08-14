@@ -25,21 +25,13 @@ def _tokens(text):
     return {t for t in tokens if t not in stop and len(t) > 2}
 
 
-def _lecture_text(lecture_id, include_ocr=True):
+def _lecture_text(lecture_id):
     conn = get_conn()
-    if include_ocr:
-        rows = conn.execute(
-            "SELECT text, ocr_text FROM slides WHERE lecture_id=?",
-            (lecture_id,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT text FROM slides WHERE lecture_id=?",
-            (lecture_id,),
-        ).fetchall()
+    rows = conn.execute(
+        "SELECT text FROM slides WHERE lecture_id=?",
+        (lecture_id,),
+    ).fetchall()
     conn.close()
-    if include_ocr:
-        return " ".join((r["text"] or "") + " " + (r["ocr_text"] or "") for r in rows)
     return " ".join((r["text"] or "") for r in rows)
 
 
@@ -51,7 +43,7 @@ def _jaccard(a, b):
     return inter / union if union else 0.0
 
 
-def detect_duplicate(text, threshold=0.55, lecture_ids=None, existing_include_ocr=True):
+def detect_duplicate(text, threshold=0.55, lecture_ids=None):
     """Given raw slide text of a candidate lecture, return the id+title of an
     existing lecture it duplicates, or None."""
     cand = _tokens(text)
@@ -68,7 +60,7 @@ def detect_duplicate(text, threshold=0.55, lecture_ids=None, existing_include_oc
     best = None
     best_score = 0.0
     for l in lectures:
-        existing = _tokens(_lecture_text(l["id"], include_ocr=existing_include_ocr))
+        existing = _tokens(_lecture_text(l["id"]))
         score = _jaccard(cand, existing)
         if score > best_score:
             best_score = score
@@ -80,13 +72,11 @@ def detect_duplicate(text, threshold=0.55, lecture_ids=None, existing_include_oc
 
 def detect_duplicate_file(path, lecture_ids=None):
     """Detect duplicate from a file path (extracts text fresh, text-only compare)."""
-    from app.ingest.slides import extract_pdf, extract_pptx
+    from app.ingest.slides import extract_pdf
     ext = os.path.splitext(path)[1].lower()
-    if ext == ".pdf":
-        slides = extract_pdf(path)
-    else:
-        slides = extract_pptx(path)
+    if ext != ".pdf":
+        from app.ingest.convert import pptx_to_pdf
+        path = pptx_to_pdf(path)
+    slides = extract_pdf(path)
     text = " ".join(t for _, t in slides)
-    return detect_duplicate(
-        text, lecture_ids=lecture_ids, existing_include_ocr=False
-    )
+    return detect_duplicate(text, lecture_ids=lecture_ids)

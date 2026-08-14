@@ -26,6 +26,11 @@ let state = {
   quizActive: false,
   reviewSlides: [],
   segAttached: false,
+  position: 0,
+  totalQuestions: 0,
+  pendingIndex: null,   // quiz mode: the option selected but not yet submitted
+  pendingQid: null,
+  submitBtn: null,
 };
 
 // ---------- Navigation ----------
@@ -73,6 +78,7 @@ function accClass(x) {
 async function loadDashboard() {
   $("dash-loading").style.display = "";
   $("dash-content").hidden = true;
+  refreshLLMKeyStatus();
   try {
     const d = await fetch("/api/dashboard").then((r) => r.json());
     $("stat-lectures").textContent = d.lecture_count;
@@ -178,7 +184,65 @@ $("import-btn").addEventListener("click", async () => {
   }
 });
 
+// ---------- LLM settings (dashboard) ----------
+async function refreshLLMKeyStatus() {
+  const statusEl = $("llm-key-status");
+  if (!statusEl) return;
+  try {
+    const s = await fetch("/api/settings/llm").then((r) => r.json());
+    $("llm-base-url-input").value = s.base_url || "";
+    $("llm-model-input").value = s.model || "";
+    statusEl.innerHTML = s.api_key_set
+      ? `API key saved · model: <strong>${escapeHtml(s.model)}</strong>`
+      : `No API key yet. Paste your key and click Save.`;
+  } catch (e) {
+    statusEl.textContent = "";
+  }
+}
+
+const saveLLMKeyBtn = $("save-llm-key");
+if (saveLLMKeyBtn) saveLLMKeyBtn.addEventListener("click", async () => {
+  const input = $("llm-api-key-input");
+  const statusEl = $("llm-key-status");
+  const key = (input.value || "").trim();
+  if (!key) return toast("Paste an API key first");
+  const btn = $("save-llm-key");
+  btn.disabled = true;
+  statusEl.textContent = "Saving...";
+  try {
+    const res = await fetch("/api/settings/llm", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        api_key: key,
+        base_url: (($("llm-base-url-input") || {}).value || "").trim(),
+        model: (($("llm-model-input") || {}).value || "").trim(),
+      }),
+    });
+    if (!res.ok) throw new Error((await res.json()).detail || "failed");
+    input.value = "";
+    statusEl.innerHTML = "Settings saved. Used immediately for captions, summaries, and question generation.";
+    toast("LLM settings saved");
+    refreshLLMKeyStatus();
+  } catch (e) {
+    statusEl.textContent = "Failed to save: " + e.message;
+  } finally {
+    btn.disabled = false;
+  }
+});
+
 // ---------- Learn ----------
+const LEARN_STATUS_LABEL = {
+  not_started: "Not started",
+  generating: "Summarizing…",
+  done: "Summary ready",
+  error: "Summary failed",
+};
+
+function learnStatusLabel(status) {
+  return LEARN_STATUS_LABEL[status] || (status || "Not started");
+}
+
 async function loadLearnList() {
   const list = $("learn-lecture-list");
   $("learn-summary").hidden = true;
@@ -189,51 +253,76 @@ async function loadLearnList() {
     list.innerHTML = '<div class="muted">No lectures yet. Import them on the Dashboard.</div>';
     return;
   }
+  const gridView = localStorage.getItem("learn-view") === "grid";
+  list.className = gridView ? "learn-grid" : "";
+  const delBtn = (l) => `<button class="btn small ghost danger-text" id="del-${l.id}" title="Delete lecture">Delete</button>`;
+  const regenBtn = (l) => `<button class="btn small ghost" id="regen-${l.id}" title="Re-run captions + summary (vision)">Regenerate</button>`;
+
+  // Live-poll while any lecture is still generating
+  const anyGenerating = lectures.some((l) => l.summary_status === "generating");
+
   for (const l of lectures) {
-    const row = document.createElement("div");
-    row.className = "lecture-row";
-    const status = l.summary_status === "done" ? "summary ready" : l.summary_status;
-    row.innerHTML = `
-      <div class="row-main">
-        <div class="title">${escapeHtml(l.title)}</div>
-        <div class="meta">${l.slide_count} slides · ${l.word_count} words</div>
-      </div>
-      <div class="row-actions">
-        <span class="meta">${status}</span>
-        <button class="btn small ghost" id="cap-${l.id}">Captions</button>
-        <button class="btn small ghost" id="ocr-${l.id}">OCR</button>
-        <button class="btn small ghost danger-text" id="del-${l.id}">Delete</button>
-      </div>`;
-    row.addEventListener("click", (e) => {
-      if (e.target.closest("button")) return;
-      openSummary(l.id);
-    });
-    const ocr = row.querySelector(`#ocr-${l.id}`);
-    ocr.addEventListener("click", async () => {
-      ocr.disabled = true;
-      ocr.textContent = "OCR running...";
-      await fetch(`/api/lectures/${l.id}/ocr`, { method: "POST" });
-      toast("OCR + captions running in background — refresh in ~1 min");
-      setTimeout(() => { ocr.disabled = false; ocr.textContent = "OCR"; }, 3000);
-    });
-    const cap = row.querySelector(`#cap-${l.id}`);
-    cap.addEventListener("click", async () => {
-      cap.disabled = true;
-      cap.textContent = "Generating...";
-      await fetch(`/api/lectures/${l.id}/captions`, { method: "POST" });
-      toast("Generating image captions in background (~1 min)");
-      setTimeout(() => { cap.disabled = false; cap.textContent = "Captions"; }, 3000);
-    });
-    const del = row.querySelector(`#del-${l.id}`);
+    const status = learnStatusLabel(l.summary_status);
+    const captioned = l.captioned_slides || 0;
+    const capCoverage = l.slide_count ? `${captioned}/${l.slide_count} captioned` : "";
+    let el;
+    if (gridView) {
+      el = document.createElement("div");
+      el.className = "lecture-card";
+      el.innerHTML = `
+        <div class="lc-title">${escapeHtml(l.title)}</div>
+        <div class="lc-meta">${l.slide_count} slides · ${l.word_count} words</div>
+        <div class="lc-status">${status}${capCoverage ? ` · ${capCoverage}` : ""}</div>
+        <div class="lc-actions">${regenBtn(l)} ${delBtn(l)}</div>`;
+      el.addEventListener("click", (e) => {
+        if (e.target.closest("button")) return;
+        openSummary(l.id);
+      });
+    } else {
+      el = document.createElement("div");
+      el.className = "lecture-row";
+      el.innerHTML = `
+        <div class="row-main">
+          <div class="title">${escapeHtml(l.title)}</div>
+          <div class="meta">${l.slide_count} slides · ${l.word_count} words</div>
+        </div>
+        <div class="row-actions">
+          <span class="meta">${status}${capCoverage ? ` · ${capCoverage}` : ""}</span>
+          ${regenBtn(l)}
+          ${delBtn(l)}
+        </div>`;
+      el.addEventListener("click", (e) => {
+        if (e.target.closest("button")) return;
+        openSummary(l.id);
+      });
+    }
+    const del = el.querySelector(`#del-${l.id}`);
     del.addEventListener("click", async () => {
       if (!confirm(`Delete "${l.title}" and all its questions? This cannot be undone.`)) return;
       await fetch(`/api/lectures/${l.id}`, { method: "DELETE" });
       toast("Lecture deleted");
       loadLearnList();
     });
-    list.appendChild(row);
+    const regen = el.querySelector(`#regen-${l.id}`);
+    regen.addEventListener("click", async () => {
+      regen.disabled = true;
+      regen.textContent = "Regenerating…";
+      await fetch(`/api/lectures/${l.id}/regenerate`, { method: "POST" });
+      toast("Regenerating captions + summary in background");
+      setTimeout(loadLearnList, 1500);
+    });
+    list.appendChild(el);
+  }
+
+  if (anyGenerating) {
+    setTimeout(loadLearnList, 3000);
   }
 }
+
+$("learn-view-toggle").addEventListener("change", () => {
+  localStorage.setItem("learn-view", $("learn-view-toggle").checked ? "grid" : "list");
+  loadLearnList();
+});
 
 async function openSummary(lectureId) {
   state.lectureId = lectureId;
@@ -250,21 +339,19 @@ async function openSummary(lectureId) {
   if (res.status === "done" && res.summary) {
     renderSummary(res.summary);
   } else if (res.status === "generating") {
-    statusEl.textContent = "Summary is being generated. Refresh in a moment.";
-    return;
-  } else {
-    statusEl.innerHTML = `No summary yet. <button class="btn small" id="gen-summary-btn">Generate now (takes ~30-60s)</button>`;
-    $("gen-summary-btn").addEventListener("click", async () => {
-      statusEl.textContent = "Generating summary from lecture content...";
-      try {
-        await fetch(`/api/lectures/${lectureId}/summary/generate`, { method: "POST" });
-        statusEl.textContent = "Done! Reloading...";
-        res = await fetch(`/api/lectures/${lectureId}/summary`).then((r) => r.json());
-        renderSummary(res.summary);
-      } catch (e) {
-        statusEl.textContent = "Generation failed: " + e.message;
+    statusEl.textContent = "Summary is being generated — this refreshes automatically.";
+    const poll = async () => {
+      const again = await fetch(`/api/lectures/${lectureId}/summary`).then((r) => r.json());
+      if (again.status === "done" && again.summary) {
+        renderSummary(again.summary);
+        statusEl.textContent = "";
+      } else {
+        setTimeout(poll, 3000);
       }
-    });
+    };
+    setTimeout(poll, 3000);
+  } else {
+    statusEl.textContent = "No summary yet — it's generated automatically right after import. Refresh in a moment.";
   }
   renderSourceSlides(lectureId);
 }
@@ -507,19 +594,6 @@ let timerInterval = null;
 let timerSeconds = 0;
 let timerCountingDown = false;
 
-function startTimer() {
-  stopTimer();
-  timerCountingDown = false;
-  timerSeconds = 0;
-  $("session-timer").hidden = false;
-  $("session-timer").classList.remove("timer-danger");
-  renderTimer();
-  timerInterval = setInterval(() => {
-    timerSeconds += 1;
-    renderTimer();
-  }, 1000);
-}
-
 function startQuizCountdown(totalSeconds) {
   stopTimer();
   timerCountingDown = true;
@@ -644,15 +718,24 @@ async function renderSessionHistory() {
           <span class="muted"> · ${label} · ${timeMode} · ${status}</span><br>
           <span class="muted">${s.completed_count}/${s.target_count} answered</span>
         </div>
-        <div>${btn}</div>
+        <div class="hist-actions">
+          ${btn}
+          <button class="btn small danger-text" data-act="del" data-id="${s.id}" title="Delete session">Delete</button>
+        </div>
       </div>`;
   }).join("");
   el.innerHTML += `<div class="hist-list">${rows}</div>`;
   el.querySelectorAll("button[data-act]").forEach((btn) => {
-    btn.addEventListener("click", () => {
+    btn.addEventListener("click", async () => {
       const id = parseInt(btn.dataset.id, 10);
       if (btn.dataset.act === "resume") startExistingSession(id);
-      else startCompletedSessionReview(id);
+      else if (btn.dataset.act === "review") startCompletedSessionReview(id);
+      else if (btn.dataset.act === "del") {
+        if (!confirm("Delete this past session and its answers?")) return;
+        await fetch(`/api/sessions/${id}`, { method: "DELETE" });
+        toast("Session deleted");
+        renderSessionHistory();
+      }
     });
   });
 }
@@ -706,24 +789,59 @@ async function startExistingSession(sid) {
   $("review-results").innerHTML = "";
   stopTimer();
   state.quizActive = false;
+  state.position = 0;
   try {
     const sess = await fetch(`/api/sessions/${sid}`).then((r) => r.json());
     state.tutorMode = sess.session.tutor_mode !== 0;
     state.quizTotal = (sess.session.time_limit_min || 0) * 60;
+    state.totalQuestions = sess.session.target_count || sess.questions.length;
     if (!state.tutorMode) {
       const elapsed = sess.session.elapsed_sec || 0;
       state.quizActive = true;
       startQuizCountdown(Math.max(0, state.quizTotal - elapsed));
+    } else {
+      // Tutor: continuous count-up timer across all questions until pause/submit.
+      startTutorTimer(sess.session.elapsed_sec || 0);
     }
+    // Resume at first unanswered position
+    const firstUnanswered = sess.questions.findIndex((q) => !q.answered);
+    state.position = firstUnanswered >= 0 ? firstUnanswered : 0;
   } catch (e) {
     state.tutorMode = true;
     state.quizTotal = 0;
+    startTutorTimer(0);
   }
-  loadNextQuestion();
+  loadQuestionAt(state.position);
+}
+
+function startTutorTimer(initialSec) {
+  stopTimer();
+  timerCountingDown = false;
+  timerSeconds = initialSec || 0;
+  $("session-timer").hidden = false;
+  $("session-timer").classList.remove("timer-danger");
+  renderTimer();
+  timerInterval = setInterval(() => {
+    timerSeconds += 1;
+    renderTimer();
+  }, 1000);
 }
 
 async function pauseActiveQuiz() {
-  if (!state.quizActive || !state.sessionId || state.tutorMode) return;
+  if (!state.sessionId) return;
+  if (state.tutorMode) {
+    // persist elapsed count-up time so resume restores it
+    stopTimer();
+    try {
+      await fetch(`/api/sessions/${state.sessionId}/pause`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ elapsed_sec: Math.round(timerSeconds) }),
+      });
+    } catch (e) { console.error("pause failed", e); }
+    return;
+  }
+  if (!state.quizActive) return;
   const elapsed = Math.max(0, state.quizTotal - timerSeconds);
   state.quizActive = false;
   stopTimer();
@@ -750,7 +868,7 @@ async function startCompletedSessionReview(sid) {
 
 async function onQuizTimeout() {
   stopTimer();
-  toast("Time's up — grading unanswered questions as incorrect");
+  toast("Time's up — grading as incorrect");
   try {
     await fetch(`/api/sessions/${state.sessionId}/timeout`, { method: "POST" });
   } catch (e) {
@@ -759,31 +877,51 @@ async function onQuizTimeout() {
   await showReviewResults();
 }
 
-async function loadNextQuestion() {
-  if (state.tutorMode) startTimer();
-  const res = await fetch(`/api/sessions/${state.sessionId}/next`).then((r) => r.json());
+async function submitQuiz() {
+  stopTimer();
+  await fetch(`/api/sessions/${state.sessionId}/submit`, { method: "POST" });
+  toast("Quiz submitted for grading");
+  await showReviewResults();
+}
+
+async function loadQuestionAt(pos) {
+  const res = await fetch(`/api/sessions/${state.sessionId}/question/${pos}`).then((r) => r.json());
   const card = $("question-card");
   if (res.done) {
     showReviewResults();
     return;
   }
+  state.position = pos;
   state.optionSelected = false;
+  state.pendingIndex = null;
+  state.pendingQid = null;
   currentQid = res.question.id;
   const q = res.question;
   state.currentImages = q.source_images || [];
   state.currentSlide = q.source_slide || null;
 
   const opts = q.options.map((o, i) => {
-    const letter = String.fromCharCode(65 + i);
-    return `<button class="option" data-idx="${i}" data-correct="${q.correct_index === i ? 1 : 0}">
-      <strong>${letter}.</strong> ${escapeHtml(o)}
+    const isCorrect = q.correct_index === i;
+    return `<button class="option" data-idx="${i}" data-correct="${isCorrect ? 1 : 0}">
+      <strong>${letter(i)}.</strong> ${escapeHtml(o)}
     </button>`;
   }).join("");
 
   const prog = $("session-progress");
   const sess = await fetch(`/api/sessions/${state.sessionId}`).then((r) => r.json());
-  prog.textContent = `Question ${sess.session.completed_count + 1} of ${sess.session.target_count}` +
+  prog.textContent = `Question ${pos + 1} of ${sess.questions.length}` +
     ` · ${state.tutorMode ? "Tutor" : "Quiz"}`;
+
+  const isLast = pos + 1 >= sess.questions.length;
+  let nextBtnHtml = isLast
+    ? (state.tutorMode ? `<button class="btn" id="next-q">Finish</button>` : "")
+    : `<button class="btn" id="next-q" ${state.tutorMode ? "" : "disabled"}>Next</button>`;
+  const navBtns = `
+    <div class="quiz-nav">
+      ${pos > 0 ? `<button class="btn ghost" id="prev-q">Back</button>` : ""}
+      ${nextBtnHtml}
+      ${!state.tutorMode ? `<button class="btn" id="submit-q">Submit quiz</button>` : ""}
+    </div>`;
 
   card.innerHTML = `
     <div class="question-box">
@@ -794,35 +932,124 @@ async function loadNextQuestion() {
         <p id="explain-text"></p>
         <div id="source-images"></div>
       </div>
-      <div class="quiz-nav"><button class="btn" id="next-q" disabled>Next</button></div>
+      ${navBtns}
     </div>`;
 
   const nextBtn = card.querySelector("#next-q");
-  nextBtn.addEventListener("click", () => loadNextQuestion());
+  const prevBtn = card.querySelector("#prev-q");
+  const submitBtn = card.querySelector("#submit-q");
+  state.submitBtn = submitBtn;
+
+  const savedSelection = q.selected_index;
+
+  // Already graded (tutor answered, or quiz after submit): view-only, colors shown.
+  const graded = q.answered === 1 || (q.answered && q.answered !== 0);
+  const gradedLocked = !state.tutorMode && q.answered;
+
+  if (savedSelection !== null && savedSelection !== undefined && savedSelection !== -1) {
+    const savedOpt = card.querySelector(`.option[data-idx="${savedSelection}"]`);
+    if (savedOpt) savedOpt.classList.add("selected");
+  }
+
+  if (graded && q.correct_index !== null && q.correct_index !== undefined) {
+    // Show correct/wrong for the recorded answer
+    card.querySelectorAll(".option").forEach((b) => {
+      const bi = parseInt(b.dataset.idx, 10);
+      if (bi === q.correct_index) b.classList.add("correct");
+      else if (savedSelection === bi && savedSelection !== q.correct_index) b.classList.add("wrong");
+    });
+    const exp = $("explain-text");
+    if (exp) exp.innerHTML = marked(q.explanation || "No explanation provided.");
+    const srcImg = $("source-images");
+    if (srcImg && (state.currentImages && state.currentImages.length || state.currentSlide)) {
+      if (state.currentImages && state.currentImages.length) {
+        const cite = citationHTML(state.currentSlide);
+        srcImg.innerHTML = `<h4 class="src-title">Source material <span class="muted">(click to zoom)</span></h4>` +
+          state.currentImages.map((u) => `<img class="src-img" src="${u}" loading="lazy">`).join("") +
+          cite;
+        wireImageZoom(srcImg);
+      } else if (state.currentSlide) {
+        const cite = citationHTML(state.currentSlide);
+        srcImg.innerHTML = cite ? `<h4 class="src-title">Source</h4>${cite}` : "";
+      }
+    }
+    const expBox = $("question-card").querySelector(".explanation");
+    if (expBox) expBox.hidden = false;
+    // lock: disable all options for graded tutor view
+    card.querySelectorAll(".option").forEach((b) => { b.disabled = true; });
+    state.optionSelected = true;
+  }
 
   card.querySelectorAll(".option").forEach((btn) => {
     btn.addEventListener("click", () => {
       if (state.optionSelected) return;
-      state.optionSelected = true;
-      nextBtn.disabled = false;
       const idx = parseInt(btn.dataset.idx, 10);
       if (state.tutorMode) {
+        // Tutor: immediate grading. Mark only the picked option wrong and the
+        // correct option green (fixes all-answers-red bug).
+        state.optionSelected = true;
+        if (nextBtn) nextBtn.disabled = false;
         const correct = btn.dataset.correct === "1";
         btn.classList.add(correct ? "correct" : "wrong");
         document.querySelectorAll(".option").forEach((b) => {
-          if (b.dataset.correct === "1") b.classList.add("correct");
-          if (!correct) b.classList.add("wrong");
+          if (b.dataset.correct === "1" && !correct) b.classList.add("correct");
         });
-        stopTimer();
         submitAnswer(q.id, idx, correct, true);
       } else {
+        // Quiz: select freely, changeable until submit.
+        if (gradedLocked) return;
+        card.querySelectorAll(".option").forEach((b) => b.classList.remove("selected"));
         btn.classList.add("selected");
-        document.querySelectorAll(".option").forEach((b) => {
-          if (b !== btn) b.disabled = true;
-        });
-        submitAnswer(q.id, idx, btn.dataset.correct === "1", false);
+        state.pendingIndex = idx;
+        state.pendingQid = q.id;
+        if (nextBtn) nextBtn.disabled = false;
       }
     });
+  });
+
+  if (prevBtn) prevBtn.addEventListener("click", () => loadQuestionAt(pos - 1));
+  if (nextBtn) nextBtn.addEventListener("click", async () => {
+    if (state.tutorMode) {
+      if (isLast) { showReviewResults(); return; }
+      loadQuestionAt(pos + 1);
+      return;
+    }
+    // Quiz: submit the pending selection, then advance.
+    if (state.pendingIndex !== null) {
+      await saveQuizSelection(state.pendingQid, state.pendingIndex);
+      state.pendingIndex = null;
+      state.pendingQid = null;
+    }
+    if (isLast) { showReviewResults(); return; }
+    loadQuestionAt(pos + 1);
+  });
+  if (submitBtn) submitBtn.addEventListener("click", submitQuiz);
+  refreshSubmitEnabled();
+}
+
+function letter(i) { return String.fromCharCode(65 + i); }
+
+async function refreshSubmitEnabled() {
+  // Enable "Submit quiz" once every question has a selection saved.
+  if (state.tutorMode || !state.submitBtn) return;
+  let sess = null;
+  try {
+    sess = await fetch(`/api/sessions/${state.sessionId}`).then((r) => r.json());
+  } catch (e) { return; }
+  const answered = sess.questions.filter((q) =>
+    q.selected_index !== null && q.selected_index !== undefined
+  ).length;
+  state.submitBtn.disabled = answered < sess.questions.length;
+  state.submitBtn.textContent = answered >= sess.questions.length
+    ? "Submit quiz"
+    : `Submit quiz (${answered}/${sess.questions.length})`;
+}
+
+async function saveQuizSelection(qid, index) {
+  await fetch(`/api/sessions/${state.sessionId}/answer/${qid}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ selected_index: index }),
   });
 }
 

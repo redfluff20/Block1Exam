@@ -353,6 +353,28 @@ input[type="file"] { max-width: 100%; }
 }
 
 /* Learn */
+.learn-toolbar { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+.view-toggle { font-size: 15px; color: var(--muted); display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.view-toggle input { accent-color: var(--accent); }
+
+.learn-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 14px; }
+.lecture-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px;
+  cursor: pointer;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: border-color 0.2s, box-shadow 0.2s;
+}
+.lecture-card:hover { border-color: var(--accent); }
+.lc-title { font-weight: 600; font-size: 17px; line-height: 1.3; }
+.lc-meta { color: var(--muted); font-size: 14px; }
+.lc-status { font-size: 14px; color: var(--muted); }
+.lc-actions { margin-top: auto; display: flex; justify-content: flex-end; }
+
 .lecture-row {
   background: var(--card);
   border: 1px solid var(--border);
@@ -466,6 +488,7 @@ input[type="file"] { max-width: 100%; }
 }
 .hist-row .w-title { font-size: 17px; }
 .hist-info { min-width: 0; }
+.hist-actions { display: flex; align-items: center; gap: 6px; flex-shrink: 0; }
 
 /* Source slide modal */
 #slide-modal {
@@ -544,7 +567,7 @@ input[type="file"] { max-width: 100%; }
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.5; } }
 
 /* Quiz mode */
-.quiz-nav { margin-top: 18px; text-align: right; }
+.quiz-nav { margin-top: 18px; text-align: right; display: flex; justify-content: flex-end; gap: 8px; }
 .option.selected { border-color: var(--accent); background: var(--hover-bg); }
 
 /* Review results */

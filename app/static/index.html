@@ -41,6 +41,15 @@
       </div>
 
       <div class="panel">
+        <h3>LLM settings <span class="hint">(Qwen vision via OpenRouter)</span></h3>
+        <input type="password" id="llm-api-key-input" placeholder="API key (sk-or-...)" autocomplete="off" spellcheck="false">
+        <input type="text" id="llm-base-url-input" placeholder="Base URL (optional)" autocomplete="off" spellcheck="false">
+        <input type="text" id="llm-model-input" placeholder="Model (optional)" autocomplete="off" spellcheck="false">
+        <button id="save-llm-key" class="btn">Save settings</button>
+        <div id="llm-key-status" class="muted"></div>
+      </div>
+
+      <div class="panel">
         <h3>Import lectures (PDF / PPTX)</h3>
         <input type="file" id="file-input" multiple accept=".pdf,.pptx">
         <button id="import-btn" class="btn">Import</button>
@@ -82,6 +91,13 @@
 
   <!-- LEARN -->
   <section id="view-learn" class="view">
+    <div class="learn-toolbar">
+      <h3>Lectures</h3>
+      <label class="view-toggle">
+        <input type="checkbox" id="learn-view-toggle" title="Toggle list/grid view">
+        Grid view
+      </label>
+    </div>
     <div id="learn-lecture-list"></div>
     <div id="learn-summary" hidden>
       <button id="learn-back" class="btn small">Back to lectures</button>
